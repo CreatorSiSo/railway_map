@@ -1,3 +1,4 @@
 /target
 /assets/*.osm.pbf
+/cache/*.bin
 rail_map.pdf
