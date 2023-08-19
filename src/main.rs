@@ -1,7 +1,9 @@
 use osmpbfreader::{Node, NodeId, OsmObj, OsmPbfReader, Way, WayId};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek};
+use std::path::PathBuf;
 use std::{collections::HashMap, io::BufWriter};
 
 mod gen_pdf;
@@ -40,32 +42,78 @@ impl Rail {
 
 const CHUNK_NAMES: &[&str] = &["slovenia-latest", "bremen-latest", "sachsen-latest"];
 
-fn main() {
-	// generate_cache();
-	for name in CHUNK_NAMES {
-		let bytes = std::fs::read(format!("./cache/{name}.bin")).unwrap();
-		let chunk: Chunk = bincode::deserialize(&bytes).unwrap();
-		generate_pdf(chunk.nodes, chunk.ways)
-			.save(&mut BufWriter::new(
-				File::create(format!("./{name}.pdf")).unwrap(),
-			))
-			.unwrap();
-
-		println!("Saved pdf file");
-	}
+#[derive(argh::FromArgs)]
+/// Extract data on railways from OSM data
+struct Args {
+	#[argh(subcommand)]
+	nested: Commands,
 }
 
-fn generate_cache() {
-	for name in CHUNK_NAMES {
-		let mut reader = OsmPbfReader::new(File::open(format!("./assets/{name}.osm.pbf")).unwrap());
-		let chunk = Chunk::from_pbf(name.to_string(), &mut reader);
+#[derive(argh::FromArgs)]
+#[argh(subcommand)]
+enum Commands {
+	Filter(FilterCommand),
+	Pdf(PdfCommand),
+}
 
-		std::fs::write(
-			format!("./cache/{}.bin", chunk.name),
-			bincode::serialize(&chunk).unwrap(),
-		)
-		.unwrap();
-	}
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "filter")]
+/// Load and filter data from .osm.pbf files
+struct FilterCommand {
+	#[argh(switch, short = 'f')]
+	/// ignore and rebuild the entire cache
+	force: bool,
+}
+
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "pdf")]
+/// Generate .pdf files based on the filtered data
+struct PdfCommand {}
+
+fn main() {
+	let args: Args = argh::from_env();
+
+	match args.nested {
+		Commands::Filter(FilterCommand { force }) => {
+			filter(force, CHUNK_NAMES)
+				.iter()
+				.for_each(|result| match result {
+					Ok(cached_chunk) => println!("{:?}", cached_chunk.0),
+					Err(err) => println!("{err}"),
+				})
+		}
+		Commands::Pdf(_) => {
+			gen(CHUNK_NAMES);
+		}
+	};
+}
+
+fn filter(force: bool, chunk_names: &[&str]) -> Vec<anyhow::Result<CachedChunk>> {
+	chunk_names
+		.par_iter()
+		.map(|name| {
+			let path = PathBuf::from(format!("./cache/{name}.bin"));
+			if force || !path.exists() {
+				let mut reader = OsmPbfReader::new(File::open(format!("./assets/{name}.osm.pbf"))?);
+				let chunk = Chunk::from_pbf(name.to_string(), &mut reader);
+				std::fs::write(&path, bincode::serialize(&chunk)?)?;
+			}
+			Ok(CachedChunk(path))
+		})
+		.collect()
+}
+
+fn gen(chunk_names: &[&str]) {
+	filter(false, chunk_names)
+		.into_par_iter()
+		.map(|cached_chunk| {
+			let chunk: Chunk = cached_chunk?.try_into()?;
+			generate_pdf(chunk.nodes, chunk.ways).save(&mut BufWriter::new(File::create(
+				format!("./{}.pdf", chunk.name),
+			)?))?;
+			Ok("Saved pdf file")
+		})
+		.for_each(|result: anyhow::Result<&str>| println!("{result:?}"));
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -115,5 +163,16 @@ impl Chunk {
 		println!("Successfully read {} nodes", nodes.len());
 
 		Chunk { name, ways, nodes }
+	}
+}
+
+struct CachedChunk(PathBuf);
+
+impl TryFrom<CachedChunk> for Chunk {
+	type Error = anyhow::Error;
+
+	fn try_from(CachedChunk(path): CachedChunk) -> Result<Self, Self::Error> {
+		let bytes = std::fs::read(path)?;
+		Ok(bincode::deserialize(&bytes)?)
 	}
 }
