@@ -1,14 +1,13 @@
 use indicatif::MultiProgress;
-use indicatif::MultiProgressAlignment;
 use indicatif::ParallelProgressIterator;
 use indicatif::ProgressBar;
-use indicatif::ProgressIterator;
 use indicatif::ProgressStyle;
 use osmpbfreader::{Node, NodeId, OsmObj, OsmPbfReader, Way, WayId};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 mod gen_pdf;
 use gen_pdf::generate_pdf;
@@ -90,46 +89,31 @@ fn main() {
 	let region_names = config.regions.get("europe").unwrap();
 
 	match args.nested {
-		Commands::Filter(FilterCommand {
-			force,
-			tasks: tasks_wanted,
-		}) => {
-			let chunk_len = (region_names.len() / tasks_wanted).max(1);
-			let tasks = region_names.par_chunks(chunk_len);
+		Commands::Filter(FilterCommand { force, .. }) => {
+			let multi_progress = MultiProgress::new();
 
-			let progress_bars = MultiProgress::new();
-			progress_bars.set_alignment(MultiProgressAlignment::Bottom);
-
-			let overall_progress = progress_bars
+			let overall_progress = multi_progress
 				.add(ProgressBar::new(region_names.len() as u64))
 				.with_style(
 					ProgressStyle::default_bar()
-						.template("\n{msg}: [{wide_bar}] {pos}/{len} {duration_precise}")
+						.template(
+							"\n[{duration_precise}] [{wide_bar:.yellow/orange}] {pos}/{len} {eta}",
+						)
 						.unwrap(),
 				)
 				.with_message("Overall");
+			overall_progress.enable_steady_tick(Duration::from_millis(10));
 
-			tasks
-				.map(|region_names| {
-					region_names
-						.into_iter()
-						.progress_with(
-							progress_bars
-								.insert_before(
-									&overall_progress,
-									ProgressBar::new(region_names.len() as u64),
-								)
-								.with_style(
-									ProgressStyle::default_spinner()
-										.template(" | {spinner} {msg} {pos}/{len}")
-										.unwrap(),
-								)
-								.with_message(region_names.join(", ")),
-						)
-						.map(|region_name| filter(region_name.clone(), force.clone(), &config))
-						.collect::<Vec<_>>()
+			region_names
+				.par_iter()
+				.map(|region_name| {
+					filter(
+						multi_progress.clone(),
+						region_name.clone(),
+						force.clone(),
+						&config,
+					)
 				})
-				.flatten()
 				.progress_with(overall_progress.clone())
 				.for_each(|maybe_cache| {
 					maybe_cache.unwrap();
@@ -145,21 +129,23 @@ fn main() {
 }
 
 fn filter(
-	name: String,
+	multi_progress: MultiProgress,
+	region: String,
 	force: bool,
 	Config {
 		server_url, suffix, ..
 	}: &Config,
 ) -> anyhow::Result<RegionCache> {
-	let osm_pbf_path = PathBuf::from(format!("./assets/{name}{suffix}.osm.pbf"));
+	let osm_pbf_path = PathBuf::from(format!("./assets/{region}{suffix}.osm.pbf"));
 
 	download_file(
-		&format!("{server_url}/europe/{name}{suffix}.osm.pbf"),
-		&format!("{server_url}/europe/{name}{suffix}.osm.pbf.md5"),
+		multi_progress,
+		&format!("{server_url}/europe/{region}{suffix}.osm.pbf"),
+		&format!("{server_url}/europe/{region}{suffix}.osm.pbf.md5"),
 		&osm_pbf_path,
 	)?;
 
-	let cache_path = PathBuf::from(format!("./cache/{name}.bin"));
+	let cache_path = PathBuf::from(format!("./cache/{region}.bin"));
 	if force || !cache_path.exists() {
 		let mut reader = OsmPbfReader::new(std::fs::File::open(osm_pbf_path)?);
 
@@ -200,7 +186,11 @@ fn filter(
 
 		// println!("Successfully read {} nodes", nodes.len());
 
-		let chunk = Region { name, ways, nodes };
+		let chunk = Region {
+			name: region,
+			ways,
+			nodes,
+		};
 
 		std::fs::write(&cache_path, &bincode::serialize(&chunk)?)?;
 		// println!("Saved {cache_path:?}");
@@ -210,35 +200,57 @@ fn filter(
 }
 
 #[tokio::main]
-async fn download_file(url: &str, md5_url: &str, path: &PathBuf) -> anyhow::Result<()> {
+async fn download_file(
+	multi_progress: MultiProgress,
+	url: &str,
+	md5_url: &str,
+	path: &PathBuf,
+) -> anyhow::Result<()> {
 	use futures_util::StreamExt;
 	use tokio::io::AsyncWriteExt;
 
+	let spinner = multi_progress.add(ProgressBar::new_spinner());
+	spinner.set_style(ProgressStyle::with_template("{spinner} {msg}")?);
+
+	spinner.set_message("🔍 Checking whether file exists");
 	let up_to_date = path.exists() && {
+		spinner.set_message("🚚 Fetching MD5 hash file");
 		let text = &reqwest::get(md5_url).await?.text().await?;
 		let (md5_hash, expected_file_name) = text.split_once(" ").unwrap();
+
+		spinner.set_message("🔍 Comparing MD5 hashes");
 		assert_eq!(path.file_name().unwrap(), expected_file_name.trim());
 		md5_hash == format!("{:x}", md5::compute(tokio::fs::read(&path).await?))
 	};
 
 	if !up_to_date {
-		// println!("Downloading `{url}`");
-
-		let mut stream = reqwest::get(url).await?.bytes_stream();
+		spinner.set_message("🚚 Fetching metadata");
+		let res = reqwest::get(url).await?;
+		let len = res.content_length().unwrap_or(0);
+		let mut stream = res.bytes_stream();
 		let mut file = tokio::fs::File::create(&path).await?;
 
-		while let Some(item) = stream.next().await {
-			file.write_all_buf(&mut item?).await?;
-		}
+		spinner.set_message(format!("\"{url}\""));
+		spinner.set_style(
+			ProgressStyle::with_template(
+				"[{elapsed_precise}] {msg:70} [{wide_bar:.cyan/blue}] {bytes:>12}/{total_bytes:12} {eta:>3}",
+			)?
+			.progress_chars("##-"),
+		);
+		spinner.set_length(len);
 
-		// println!("Saved {path:?}");
+		while let Some(maybe_chunk) = stream.next().await {
+			let mut chunk = maybe_chunk?;
+			spinner.set_position(spinner.position() + chunk.len() as u64);
+			file.write_all_buf(&mut chunk).await?;
+		}
 	}
 
 	Ok(())
 }
 
 fn gen(region_name: String, config: Config) -> anyhow::Result<()> {
-	let cache = filter(region_name, false, &config)?;
+	let cache = filter(todo!(), region_name, false, &config)?;
 	let region: Region = cache.try_into()?;
 	let bytes = generate_pdf(region.nodes, region.ways).save_to_bytes()?;
 	std::fs::write(format!("./{}.pdf", region.name), &bytes)?;
