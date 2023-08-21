@@ -1,10 +1,14 @@
+use indicatif::MultiProgress;
+use indicatif::MultiProgressAlignment;
+use indicatif::ParallelProgressIterator;
+use indicatif::ProgressBar;
+use indicatif::ProgressIterator;
+use indicatif::ProgressStyle;
 use osmpbfreader::{Node, NodeId, OsmObj, OsmPbfReader, Way, WayId};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Seek};
 use std::path::PathBuf;
-use std::{collections::HashMap, io::BufWriter};
 
 mod gen_pdf;
 use gen_pdf::generate_pdf;
@@ -40,8 +44,6 @@ impl Rail {
 	}
 }
 
-const CHUNK_NAMES: &[&str] = &["slovenia-latest", "bremen-latest", "sachsen-latest"];
-
 #[derive(argh::FromArgs)]
 /// Extract data on railways from OSM data
 struct Args {
@@ -63,6 +65,10 @@ struct FilterCommand {
 	#[argh(switch, short = 'f')]
 	/// ignore and rebuild the entire cache
 	force: bool,
+
+	#[argh(option, default = "4", short = 't')]
+	/// amount of parallel tasks to use
+	tasks: usize,
 }
 
 #[derive(argh::FromArgs)]
@@ -70,61 +76,93 @@ struct FilterCommand {
 /// Generate .pdf files based on the filtered data
 struct PdfCommand {}
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Config {
+	server_url: String,
+	suffix: String,
+	regions: HashMap<String, Vec<String>>,
+}
+
 fn main() {
 	let args: Args = argh::from_env();
+	let config: Config =
+		toml::from_str(&std::fs::read_to_string("./config.toml").unwrap()).unwrap();
+	let region_names = config.regions.get("europe").unwrap();
 
 	match args.nested {
-		Commands::Filter(FilterCommand { force }) => {
-			filter(force, CHUNK_NAMES)
-				.iter()
-				.for_each(|result| match result {
-					Ok(cached_chunk) => println!("{:?}", cached_chunk.0),
-					Err(err) => println!("{err}"),
+		Commands::Filter(FilterCommand {
+			force,
+			tasks: tasks_wanted,
+		}) => {
+			let chunk_len = (region_names.len() / tasks_wanted).max(1);
+			let tasks = region_names.par_chunks(chunk_len);
+
+			let progress_bars = MultiProgress::new();
+			progress_bars.set_alignment(MultiProgressAlignment::Bottom);
+
+			let overall_progress = progress_bars
+				.add(ProgressBar::new(region_names.len() as u64))
+				.with_style(
+					ProgressStyle::default_bar()
+						.template("\n{msg}: [{wide_bar}] {pos}/{len} {duration_precise}")
+						.unwrap(),
+				)
+				.with_message("Overall");
+
+			tasks
+				.map(|region_names| {
+					region_names
+						.into_iter()
+						.progress_with(
+							progress_bars
+								.insert_before(
+									&overall_progress,
+									ProgressBar::new(region_names.len() as u64),
+								)
+								.with_style(
+									ProgressStyle::default_spinner()
+										.template(" | {spinner} {msg} {pos}/{len}")
+										.unwrap(),
+								)
+								.with_message(region_names.join(", ")),
+						)
+						.map(|region_name| filter(region_name.clone(), force.clone(), &config))
+						.collect::<Vec<_>>()
 				})
+				.flatten()
+				.progress_with(overall_progress.clone())
+				.for_each(|maybe_cache| {
+					maybe_cache.unwrap();
+				});
 		}
 		Commands::Pdf(_) => {
-			gen(CHUNK_NAMES);
+			region_names
+				.par_iter()
+				.map(|region_name| gen(region_name.clone(), config.clone()))
+				.for_each(|maybe_cache| println!("{maybe_cache:?}"));
 		}
 	};
 }
 
-fn filter(force: bool, chunk_names: &[&str]) -> Vec<anyhow::Result<CachedChunk>> {
-	chunk_names
-		.par_iter()
-		.map(|name| {
-			let path = PathBuf::from(format!("./cache/{name}.bin"));
-			if force || !path.exists() {
-				let mut reader = OsmPbfReader::new(File::open(format!("./assets/{name}.osm.pbf"))?);
-				let chunk = Chunk::from_pbf(name.to_string(), &mut reader);
-				std::fs::write(&path, bincode::serialize(&chunk)?)?;
-			}
-			Ok(CachedChunk(path))
-		})
-		.collect()
-}
-
-fn gen(chunk_names: &[&str]) {
-	filter(false, chunk_names)
-		.into_par_iter()
-		.map(|cached_chunk| {
-			let chunk: Chunk = cached_chunk?.try_into()?;
-			generate_pdf(chunk.nodes, chunk.ways).save(&mut BufWriter::new(File::create(
-				format!("./{}.pdf", chunk.name),
-			)?))?;
-			Ok("Saved pdf file")
-		})
-		.for_each(|result: anyhow::Result<&str>| println!("{result:?}"));
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct Chunk {
+fn filter(
 	name: String,
-	ways: Vec<Way>,
-	nodes: HashMap<NodeId, Node>,
-}
+	force: bool,
+	Config {
+		server_url, suffix, ..
+	}: &Config,
+) -> anyhow::Result<RegionCache> {
+	let osm_pbf_path = PathBuf::from(format!("./assets/{name}{suffix}.osm.pbf"));
 
-impl Chunk {
-	fn from_pbf<R: Read + Seek>(name: String, reader: &mut OsmPbfReader<R>) -> Self {
+	download_file(
+		&format!("{server_url}/europe/{name}{suffix}.osm.pbf"),
+		&format!("{server_url}/europe/{name}{suffix}.osm.pbf.md5"),
+		&osm_pbf_path,
+	)?;
+
+	let cache_path = PathBuf::from(format!("./cache/{name}.bin"));
+	if force || !cache_path.exists() {
+		let mut reader = OsmPbfReader::new(std::fs::File::open(osm_pbf_path)?);
+
 		let ways: Vec<Way> = reader
 			.par_iter()
 			.filter_map(|maybe_obj| {
@@ -137,7 +175,7 @@ impl Chunk {
 			})
 			.collect();
 
-		println!("Successfully read {} ways", ways.len());
+		// println!("Successfully read {} ways", ways.len());
 
 		let required_node_ids =
 			ways.iter()
@@ -148,7 +186,7 @@ impl Chunk {
 
 		reader.rewind().unwrap();
 
-		println!("Gathered {} required node ids", required_node_ids.len());
+		// println!("Gathered {} required node ids", required_node_ids.len());
 
 		let nodes: HashMap<NodeId, Node> = reader
 			.par_iter()
@@ -160,18 +198,67 @@ impl Chunk {
 			})
 			.collect();
 
-		println!("Successfully read {} nodes", nodes.len());
+		// println!("Successfully read {} nodes", nodes.len());
 
-		Chunk { name, ways, nodes }
+		let chunk = Region { name, ways, nodes };
+
+		std::fs::write(&cache_path, &bincode::serialize(&chunk)?)?;
+		// println!("Saved {cache_path:?}");
 	}
+
+	Ok(RegionCache(cache_path))
 }
 
-struct CachedChunk(PathBuf);
+#[tokio::main]
+async fn download_file(url: &str, md5_url: &str, path: &PathBuf) -> anyhow::Result<()> {
+	use futures_util::StreamExt;
+	use tokio::io::AsyncWriteExt;
 
-impl TryFrom<CachedChunk> for Chunk {
+	let up_to_date = path.exists() && {
+		let text = &reqwest::get(md5_url).await?.text().await?;
+		let (md5_hash, expected_file_name) = text.split_once(" ").unwrap();
+		assert_eq!(path.file_name().unwrap(), expected_file_name.trim());
+		md5_hash == format!("{:x}", md5::compute(tokio::fs::read(&path).await?))
+	};
+
+	if !up_to_date {
+		// println!("Downloading `{url}`");
+
+		let mut stream = reqwest::get(url).await?.bytes_stream();
+		let mut file = tokio::fs::File::create(&path).await?;
+
+		while let Some(item) = stream.next().await {
+			file.write_all_buf(&mut item?).await?;
+		}
+
+		// println!("Saved {path:?}");
+	}
+
+	Ok(())
+}
+
+fn gen(region_name: String, config: Config) -> anyhow::Result<()> {
+	let cache = filter(region_name, false, &config)?;
+	let region: Region = cache.try_into()?;
+	let bytes = generate_pdf(region.nodes, region.ways).save_to_bytes()?;
+	std::fs::write(format!("./{}.pdf", region.name), &bytes)?;
+	Ok(())
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct Region {
+	name: String,
+	ways: Vec<Way>,
+	nodes: HashMap<NodeId, Node>,
+}
+
+#[derive(Debug)]
+struct RegionCache(PathBuf);
+
+impl TryFrom<RegionCache> for Region {
 	type Error = anyhow::Error;
 
-	fn try_from(CachedChunk(path): CachedChunk) -> Result<Self, Self::Error> {
+	fn try_from(RegionCache(path): RegionCache) -> Result<Self, Self::Error> {
 		let bytes = std::fs::read(path)?;
 		Ok(bincode::deserialize(&bytes)?)
 	}
