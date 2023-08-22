@@ -2,6 +2,7 @@ server_url = "https://download.geofabrik.de/"
 suffix = "-latest"
 
 [regions]
+russia = []
 europe = [
 	"albania",
 	"andorra",
@@ -44,7 +45,6 @@ europe = [
 	"poland",
 	"portugal",
 	"romania",
-	# "russia",
 	"serbia",
 	"slovakia",
 	"slovenia",
