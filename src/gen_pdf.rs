@@ -1,6 +1,6 @@
-use super::Rail;
+// use super::Rail;
 use geo::{BoundingRect, LineString};
-use osmpbfreader::{Node, NodeId, Way};
+use osmpbfreader::{Node, NodeId, Way, WayId};
 use printpdf as pdf;
 use printpdf::{Mm, PdfDocument, PdfDocumentReference};
 use std::collections::HashMap;
@@ -15,13 +15,13 @@ pub fn generate_pdf(nodes: HashMap<NodeId, Node>, ways: Vec<Way>) -> PdfDocument
 
 	println!("Calculated bounding box");
 
-	const SCALE: f64 = 60.;
-	let page_width = Mm(bounds.width() * SCALE / 1.4);
-	let page_height = Mm(bounds.height() * SCALE);
+	const SCALE: f32 = 60.;
+	let page_width = Mm(bounds.width() as f32 * SCALE / 1.4);
+	let page_height = Mm(bounds.height() as f32 * SCALE);
 	let coord_to_point = |(x, y): (f64, f64)| -> pdf::Point {
 		pdf::Point::new(
-			Mm((x - bounds.min().x) * SCALE / 1.4),
-			Mm((y - bounds.min().y) * SCALE),
+			Mm((x - bounds.min().x) as f32 * SCALE / 1.4),
+			Mm((y - bounds.min().y) as f32 * SCALE),
 		)
 	};
 
@@ -33,9 +33,8 @@ pub fn generate_pdf(nodes: HashMap<NodeId, Node>, ways: Vec<Way>) -> PdfDocument
 		let rail = Rail::from_way(&way, &nodes);
 
 		current_layer.set_outline_color(match rail.maxspeed {
-			Some(maxspeed) => {
-				let maxspeed = maxspeed.parse::<u32>().unwrap_or(50) as f64;
-				let relative = maxspeed / 300.;
+			MaxSpeed::Single(_, speed) => {
+				let relative = speed as f32 / 300.;
 				rgb(
 					-4. * (relative - 1.).powf(2.) + 1.,
 					-4. * (relative - 0.5).powf(2.) + 1.,
@@ -45,16 +44,13 @@ pub fn generate_pdf(nodes: HashMap<NodeId, Node>, ways: Vec<Way>) -> PdfDocument
 			_ => rgb(0.5, 0.5, 0.5),
 		});
 
-		current_layer.add_shape(pdf::Line {
+		current_layer.add_line(pdf::Line {
 			points: rail
 				.geometry
 				.iter()
 				.map(|coord| (coord_to_point(*coord), false))
 				.collect(),
 			is_closed: false,
-			has_fill: false,
-			has_stroke: true,
-			is_clipping_path: false,
 		});
 	}
 
@@ -70,17 +66,92 @@ pub fn generate_pdf(nodes: HashMap<NodeId, Node>, ways: Vec<Way>) -> PdfDocument
 			(coord_to_point((bounds.min().x, bounds.max().y)), false),
 		],
 		is_closed: true,
-		has_fill: false,
-		has_stroke: true,
-		is_clipping_path: false,
 	};
-	current_layer.add_shape(bounds_line);
+	current_layer.add_line(bounds_line);
 
 	println!("Drew outline");
 
 	doc
 }
 
-fn rgb(r: f64, g: f64, b: f64) -> pdf::Color {
+fn rgb(r: f32, g: f32, b: f32) -> pdf::Color {
 	pdf::Color::Rgb(pdf::Rgb::new(r, g, b, None))
+}
+
+#[derive(Debug)]
+pub(crate) struct Rail {
+	id: WayId,
+	// TODO: Use &str or SmartString
+	name: Option<String>,
+	maxspeed: MaxSpeed,
+	geometry: Vec<(f64, f64)>,
+}
+
+impl Rail {
+	fn from_way(way: &Way, nodes: &HashMap<NodeId, Node>) -> Self {
+		Self {
+			id: way.id,
+			name: way.tags.get("name").map(|name| name.as_str().into()),
+			maxspeed: parse_maxspeed(
+				way.tags
+					.get("maxspeed")
+					.map(|string| string.as_str())
+					.unwrap_or("none"),
+			),
+			geometry: way
+				.nodes
+				.iter()
+				.map(|nodeid| {
+					let node = nodes.get(nodeid).unwrap();
+					(node.lon(), node.lat())
+				})
+				.collect(),
+		}
+	}
+}
+
+fn parse_maxspeed(string: &str) -> MaxSpeed {
+	let string = string.trim();
+
+	if string == "" || string == "none" {
+		return MaxSpeed::None;
+	}
+
+	if let Ok(maxspeed) = string.parse::<u32>() {
+		return MaxSpeed::Single(SpeedUnit::KilometersPerHour, maxspeed);
+	}
+
+	if string.ends_with("mph") {
+		return MaxSpeed::Single(
+			SpeedUnit::MilesPerHour,
+			string.replace("mph", "").parse().unwrap(),
+		);
+	}
+
+	panic!("could not parse speed from {string}")
+
+	// let parts: Vec<&str> = value.split([';', ',', '|']).collect();
+	// // 	(!parts.is_empty()).then_some(parts)
+
+	// else if let Some(parts) = {
+	// 	let parts: Vec<&str> = value.split([';', ',', '|']).collect();
+	// 	(!parts.is_empty()).then_some(parts)
+	// } {
+	// 	MaxSpeed::Multiple(parts.into_iter().map(|part| parse_maxspeed(part)).collect())
+	// }
+}
+
+#[derive(Debug)]
+enum MaxSpeed {
+	Single(SpeedUnit, u32),
+	Multiple(Vec<MaxSpeed>),
+	None,
+}
+
+#[derive(Debug)]
+enum SpeedUnit {
+	MetersPerSecond,
+	KilometersPerHour,
+	MilesPerHour,
+	Knots,
 }
